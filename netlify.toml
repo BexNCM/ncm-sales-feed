@@ -1,0 +1,10 @@
+# NCM Sales Feed — isolated function site
+# This site hosts ONLY the Live Sales Report data feed.
+# Deploy it via Git (or the Netlify CLI), never by dragging a folder,
+# because drag-and-drop does not bundle functions.
+
+[build]
+  publish = "."
+
+[functions]
+  directory = "netlify/functions"
