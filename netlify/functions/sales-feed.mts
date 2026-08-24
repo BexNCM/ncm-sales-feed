@@ -3,8 +3,8 @@
    Route: /.netlify/functions/sales-feed
    Reads Supabase auctions + costings and HubSpot calls + deals, returns
    the dashboard JSON contract INCLUDING the Activity detail lists
-   (recentCalls + noOutcomeCalls). Rate-limited under HubSpot's 4/sec cap.
-   ?diagnostics=1 reports credential presence only.
+   (recentCalls + noOutcomeCalls) with call direction. Rate-limited under
+   HubSpot's 4/sec cap. ?diagnostics=1 reports credential presence only.
    ===================================================================== */
 
 const HUBSPOT_TOKEN = process.env.HUBSPOT_TOKEN;
@@ -97,12 +97,13 @@ async function callsForOwner(ownerId, sinceMs, untilMs){
         { propertyName:"hs_timestamp", operator:"GTE", value: String(sinceMs) },
         { propertyName:"hs_timestamp", operator:"LTE", value: String(untilMs) }
       ]}],
-      properties:["hs_call_disposition","hs_timestamp","hs_call_duration"],
+      properties:["hs_call_disposition","hs_timestamp","hs_call_duration","hs_call_direction"],
       limit:100, ...(after?{after}:{})
     });
     for (const o of (j.results||[])) out.push({
       id:o.id,
       dispo:o.properties.hs_call_disposition || null,
+      dir: o.properties.hs_call_direction || null,
       ts: o.properties.hs_timestamp ? Date.parse(o.properties.hs_timestamp) : null,
       dur: Number(o.properties.hs_call_duration||0)
     });
@@ -231,6 +232,7 @@ export default async (req) => {
         const co = coId ? companyNames[coId] : null;
         return {
           at: shortDate(c.ts),
+          direction: c.dir==="INBOUND" ? "in" : (c.dir==="OUTBOUND" ? "out" : ""),
           contact: ct ? (((ct.firstname||"")+" "+(ct.lastname||"")).trim() || "Unknown") : "Unknown",
           company: co && co.name ? co.name : "Unknown",
           durationS: Math.round(c.dur/1000),
