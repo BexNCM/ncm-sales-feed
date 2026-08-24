@@ -1,10 +1,12 @@
 /* =====================================================================
    LotOut Live Sales Report — data feed  (Netlify Function, v2 / .mts)
    Route: /.netlify/functions/sales-feed
-   Reads Supabase auctions + costings and HubSpot calls + deals, returns
-   the dashboard JSON contract INCLUDING the Activity detail lists
-   (recentCalls + noOutcomeCalls) with call direction. Rate-limited under
-   HubSpot's 4/sec cap. ?diagnostics=1 reports credential presence only.
+   Reads Supabase auctions + costings and HubSpot calls + deals. Returns
+   the dashboard JSON contract: activity, sourced leads, hammer pipeline
+   (Proposal sent, Client Exclusive, <90 days) with per-deal detail and
+   missing-financial flags, LotOut delivery, and Activity detail lists
+   with call direction. Rate-limited under HubSpot's 4/sec cap.
+   ?diagnostics=1 reports credential presence only.
    ===================================================================== */
 
 const HUBSPOT_TOKEN = process.env.HUBSPOT_TOKEN;
@@ -255,10 +257,39 @@ export default async (req) => {
         if (st===STAGE_NEW_LEAD && cd < overdueCut) overdue++;
       }
 
+      // Hammer pipeline: Proposal sent (Client Exclusive), open, created within 90 days
+      const cut90 = now - 90*86400000;
+      const pipeDeals = await dealSearch([
+        { propertyName:"pipeline", operator:"EQ", value:"default" },
+        { propertyName:"dealstage", operator:"EQ", value:"qualifiedtobuy" },
+        { propertyName:"hs_is_closed", operator:"EQ", value:"false" },
+        { propertyName:"hubspot_owner_id", operator:"EQ", value:rep.id },
+        { propertyName:"createdate", operator:"GTE", value:String(cut90) }
+      ], ["forecast_revenue","forecast_revenue_from_hammer","dealname"]);
+      let forecastHammer=0, forecastRevenue=0, missingHammer=0, missingRevenue=0;
+      const dealList=[];
+      for (const d of pipeDeals){
+        const h  = Number(d.properties.forecast_revenue||0);
+        const rv = Number(d.properties.forecast_revenue_from_hammer||0);
+        forecastHammer += h; forecastRevenue += rv;
+        if (!h)  missingHammer++;
+        if (!rv) missingRevenue++;
+        dealList.push({ name: d.properties.dealname || "(unnamed deal)", hammer:h, revenue:rv,
+          url: "https://app-eu1.hubspot.com/contacts/"+PORTAL+"/record/0-3/"+d.id });
+      }
+      const termsSent = await dealCount([
+        { propertyName:"pipeline", operator:"EQ", value:"default" },
+        { propertyName:"hubspot_owner_id", operator:"EQ", value:rep.id },
+        { propertyName:"hs_v2_date_entered_qualifiedtobuy", operator:"GTE", value:String(sinceMs) }
+      ]);
+
       reps.push({
         name:rep.name, role:rep.role, initials:rep.initials, ...cm,
         sourced:{ allocated, awaiting: allocated - firstTouch, overdue,
                   firstTouchPct: allocated? Math.round(firstTouch/allocated*100):0 },
+        pipeline:{ deals: pipeDeals.length, forecastHammer, forecastRevenue,
+                   missingHammer, missingRevenue, dealList,
+                   termsSent, termsSentPerDay: Number((termsSent/workingDays).toFixed(1)) },
         lotout: lotoutFor(rep.name, auctions, costings),
         recentCalls, noOutcomeCalls
       });
