@@ -4,9 +4,9 @@
    Reads Supabase auctions + costings and HubSpot calls + deals. Returns
    the dashboard JSON contract: activity, sourced leads, hammer pipeline
    (Proposal sent, Client Exclusive, <90 days) with per-deal detail and
-   missing-financial flags, LotOut delivery, and Activity detail lists
-   with call direction. Rate-limited under HubSpot's 4/sec cap.
-   ?diagnostics=1 reports credential presence only.
+   missing-financial flags, LotOut delivery + costing cross-reference,
+   and Activity detail lists with call direction. Rate-limited under
+   HubSpot's 4/sec cap. ?diagnostics=1 reports credential presence only.
    ===================================================================== */
 
 const HUBSPOT_TOKEN = process.env.HUBSPOT_TOKEN;
@@ -184,7 +184,9 @@ function lotoutFor(name, auctions, costings){
   const cs = costings.filter(c=>c.sales_lead===name);
   const costingsBy = { Draft:0, Submitted:0, Approved:0 };
   for (const c of cs){ if (costingsBy[c.status]!=null) costingsBy[c.status]++; }
-  return { jobsAsLead: mine.length, stages, jobForecast: fh, costings: costingsBy };
+  const costingList = cs.map(c=>({ name: c.title || c.client_name || "(untitled)",
+    hammer: Number(c.forecast_hammer||0), status: c.status || "" }));
+  return { jobsAsLead: mine.length, stages, jobForecast: fh, costings: costingsBy, costingList };
 }
 function json(obj, status){
   return new Response(JSON.stringify(obj), {
@@ -212,7 +214,7 @@ export default async (req) => {
 
     const [auctions, costings] = await Promise.all([
       sbGet("auctions?select=sales_lead,stage,status,forecast_hammer&status=eq.active"),
-      sbGet("costings?select=sales_lead,status,forecast_hammer")
+      sbGet("costings?select=sales_lead,status,forecast_hammer,title,client_name")
     ]);
 
     const reps = [];
