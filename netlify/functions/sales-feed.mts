@@ -2,11 +2,12 @@
    LotOut Live Sales Report — data feed  (Netlify Function, v2 / .mts)
    Route: /.netlify/functions/sales-feed
    Reads Supabase auctions + costings and HubSpot calls + deals. Returns
-   the dashboard JSON contract: activity, sourced leads, hammer pipeline
-   (Proposal sent, Client Exclusive, <90 days) with per-deal detail and
-   missing-financial flags, LotOut delivery + costing cross-reference,
-   and Activity detail lists with call direction. Rate-limited under
-   HubSpot's 4/sec cap. ?diagnostics=1 reports credential presence only.
+   the dashboard JSON contract: activity + yesterday, sourced leads
+   (sourced in last 14 days), hammer pipeline (Proposal sent, Client
+   Exclusive, <90 days) with per-deal detail + missing-financial flags,
+   LotOut delivery + costing cross-reference, and Activity detail lists
+   with call direction. Rate-limited under HubSpot's 4/sec cap.
+   ?diagnostics=1 reports credential presence only.
    ===================================================================== */
 
 const HUBSPOT_TOKEN = process.env.HUBSPOT_TOKEN;
@@ -212,6 +213,12 @@ export default async (req) => {
     const yStart = startOfUTCDay(now) - 86400000;
     const yEnd   = startOfUTCDay(now);
 
+    // previous working day (skip weekends) for the per-rep "yesterday" summary
+    let ydw = startOfUTCDay(now);
+    do { ydw -= 86400000; } while (new Date(ydw).getUTCDay()===0 || new Date(ydw).getUTCDay()===6);
+    const ydStart = ydw, ydEnd = ydw + 86400000;
+    const ydLabel = new Date(ydStart).toLocaleDateString("en-GB",{weekday:"short",day:"2-digit",month:"short"});
+
     const [auctions, costings] = await Promise.all([
       sbGet("auctions?select=sales_lead,stage,status,forecast_hammer&status=eq.active"),
       sbGet("costings?select=sales_lead,status,forecast_hammer,title,client_name")
@@ -222,6 +229,18 @@ export default async (req) => {
       const calls = await callsForOwner(rep.id, sinceMs, now);
       const companyMap = await assocMap(calls.map(c=>c.id), "companies");
       const cm = callMetrics(calls, companyMap, workingDays, weeks);
+
+      // Yesterday's activity (previous working day), from the same calls
+      let yDials=0, yDm=0, yPres=0; const yCo=new Set();
+      for (const c of calls){
+        if (c.ts>=ydStart && c.ts<ydEnd){
+          yDials++;
+          if (DM_SET.has(c.dispo)) yDm++;
+          if (c.dispo===D_BOOKED_PRES) yPres++;
+          const co=companyMap[c.id]; if (co) yCo.add(co);
+        }
+      }
+      const yesterday = { label:ydLabel, dials:yDials, companies:yCo.size, dm:yDm, presentations:yPres };
 
       const sorted = calls.slice().sort((a,b)=>(b.ts||0)-(a.ts||0));
       const recent = sorted.slice(0, RECENT_MAX);
@@ -287,6 +306,7 @@ export default async (req) => {
 
       reps.push({
         name:rep.name, role:rep.role, initials:rep.initials, ...cm,
+        yesterday,
         sourced:{ allocated, awaiting: allocated - firstTouch, overdue,
                   firstTouchPct: allocated? Math.round(firstTouch/allocated*100):0 },
         pipeline:{ deals: pipeDeals.length, forecastHammer, forecastRevenue,
@@ -303,7 +323,7 @@ export default async (req) => {
       const sourcedYesterday = await dealCount([...base,
         { propertyName:"createdate", operator:"GTE", value:String(yStart) },
         { propertyName:"createdate", operator:"LT",  value:String(yEnd) }]);
-      const openPool = await dealCount([...base, { propertyName:"hs_is_closed", operator:"EQ", value:"false" }]);
+      const openPool = await dealCount([...base, { propertyName:"createdate", operator:"GTE", value:String(sinceMs) }]);
       const own = await dealSearch([...base,
         { propertyName:"hubspot_owner_id", operator:"EQ", value:s.id },
         { propertyName:"hs_is_closed", operator:"EQ", value:"false" }], ["dealstage","createdate"]);
