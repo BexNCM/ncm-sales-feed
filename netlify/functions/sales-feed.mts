@@ -1,11 +1,10 @@
 /* =====================================================================
    LotOut Live Sales Report — data feed  (Netlify Function, v2 / .mts)
    Route: /.netlify/functions/sales-feed
-   Reads Supabase auctions + costings and HubSpot calls + deals. Returns
-   the dashboard JSON contract: activity + yesterday, sourced leads
-   (sourced in last 14 days), hammer pipeline (Proposal sent, Client
-   Exclusive, <90 days) with per-deal detail + missing-financial flags,
-   LotOut delivery + costing cross-reference, and Activity detail lists
+   Activity + today/yesterday, sourced leads (14 days), hammer pipeline
+   (Proposal sent, Client Exclusive, <90 days) with per-deal detail +
+   missing-financial flags, LotOut costing cross-reference, terms sent
+   (Exclusive + Collective), 6-week activity trends, and Activity detail
    with call direction. Rate-limited under HubSpot's 4/sec cap.
    ?diagnostics=1 reports credential presence only.
    ===================================================================== */
@@ -76,6 +75,7 @@ function workingDaysBetween(from, to){
 function startOfUTCDay(ms){ const d=new Date(ms); return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()); }
 function dayKey(ms){ return new Date(ms).toISOString().slice(0,10); }
 function shortDate(ms){ return ms ? new Date(ms).toLocaleDateString("en-GB",{day:"2-digit",month:"short"}) : ""; }
+function weekStartOf(ms){ const day=(new Date(ms).getUTCDay()+6)%7; return startOfUTCDay(ms) - day*86400000; }
 
 async function hsPost(path, body){
   for (let attempt=0; attempt<6; attempt++){
@@ -218,6 +218,16 @@ export default async (req) => {
     do { ydw -= 86400000; } while (new Date(ydw).getUTCDay()===0 || new Date(ydw).getUTCDay()===6);
     const ydStart = ydw, ydEnd = ydw + 86400000;
     const ydLabel = new Date(ydStart).toLocaleDateString("en-GB",{weekday:"short",day:"2-digit",month:"short"});
+    const todayStart = startOfUTCDay(now);
+
+    // trend scaffolding: last N Monday-start weeks
+    const TREND_WEEKS = 6;
+    const thisWeekStart = weekStartOf(now);
+    const weekStarts = [];
+    for (let i=TREND_WEEKS-1;i>=0;i--) weekStarts.push(thisWeekStart - i*7*86400000);
+    const trendSince = weekStarts[0];
+    const weekLabels = weekStarts.map(ws=>"w/c "+new Date(ws).toLocaleDateString("en-GB",{day:"2-digit",month:"short"}));
+    const weekIdx = ts => { for (let i=0;i<weekStarts.length;i++){ if (ts>=weekStarts[i] && ts<weekStarts[i]+7*86400000) return i; } return -1; };
 
     const [auctions, costings] = await Promise.all([
       sbGet("auctions?select=sales_lead,stage,status,forecast_hammer&status=eq.active"),
@@ -225,23 +235,37 @@ export default async (req) => {
     ]);
 
     const reps = [];
+    const teamWk = { dials:Array(TREND_WEEKS).fill(0), dm:Array(TREND_WEEKS).fill(0), pres:Array(TREND_WEEKS).fill(0), termsEx:Array(TREND_WEEKS).fill(0), termsCo:Array(TREND_WEEKS).fill(0) };
     for (const rep of REPS){
-      const calls = await callsForOwner(rep.id, sinceMs, now);
+      const callsAll = await callsForOwner(rep.id, trendSince, now);
+      const calls = callsAll.filter(c=>c.ts>=sinceMs);
       const companyMap = await assocMap(calls.map(c=>c.id), "companies");
       const cm = callMetrics(calls, companyMap, workingDays, weeks);
 
-      // Yesterday's activity (previous working day), from the same calls
+      // Yesterday's activity (previous working day) and today so far, from the same calls
       let yDials=0, yDm=0, yPres=0; const yCo=new Set();
+      let tDials=0, tDm=0; const tCo=new Set();
       for (const c of calls){
         if (c.ts>=ydStart && c.ts<ydEnd){
-          yDials++;
-          if (DM_SET.has(c.dispo)) yDm++;
-          if (c.dispo===D_BOOKED_PRES) yPres++;
+          yDials++; if (DM_SET.has(c.dispo)) yDm++; if (c.dispo===D_BOOKED_PRES) yPres++;
           const co=companyMap[c.id]; if (co) yCo.add(co);
+        }
+        if (c.ts>=todayStart){
+          tDials++; if (DM_SET.has(c.dispo)) tDm++;
+          const co=companyMap[c.id]; if (co) tCo.add(co);
         }
       }
       const yesterday = { label:ydLabel, dials:yDials, companies:yCo.size, dm:yDm, presentations:yPres };
+      const today = { dials:tDials, companies:tCo.size, dm:tDm };
 
+      // Weekly activity buckets over the trend window (from the 6-week pull)
+      const wk = { dials:Array(TREND_WEEKS).fill(0), dm:Array(TREND_WEEKS).fill(0), pres:Array(TREND_WEEKS).fill(0), termsEx:Array(TREND_WEEKS).fill(0), termsCo:Array(TREND_WEEKS).fill(0) };
+      for (const c of callsAll){
+        const i=weekIdx(c.ts); if (i<0) continue;
+        wk.dials[i]++; if (DM_SET.has(c.dispo)) wk.dm[i]++; if (c.dispo===D_BOOKED_PRES) wk.pres[i]++;
+      }
+
+      // ---- Activity detail lists ----
       const sorted = calls.slice().sort((a,b)=>(b.ts||0)-(a.ts||0));
       const recent = sorted.slice(0, RECENT_MAX);
       const noOut  = sorted.filter(c=>!c.dispo).slice(0, NOOUT_MAX);
@@ -265,6 +289,7 @@ export default async (req) => {
       const recentCalls = recent.map(c => ({ ...rowOf(c), outcome: OUTCOME_LABELS[c.dispo] || (c.dispo ? "Logged" : "No outcome") }));
       const noOutcomeCalls = noOut.map(rowOf);
 
+      // ---- sourced-lead follow-up (one pull) ----
       const sd = await dealSearch([
         { propertyName:"sourced_by", operator:"IN", values:SOURCED_BY },
         { propertyName:"hubspot_owner_id", operator:"EQ", value:rep.id },
@@ -298,20 +323,31 @@ export default async (req) => {
         dealList.push({ name: d.properties.dealname || "(unnamed deal)", hammer:h, revenue:rv,
           url: "https://app-eu1.hubspot.com/contacts/"+PORTAL+"/record/0-3/"+d.id });
       }
-      const termsSent = await dealCount([
+      const exEntered = await dealSearch([
         { propertyName:"pipeline", operator:"EQ", value:"default" },
         { propertyName:"hubspot_owner_id", operator:"EQ", value:rep.id },
-        { propertyName:"hs_v2_date_entered_qualifiedtobuy", operator:"GTE", value:String(sinceMs) }
-      ]);
+        { propertyName:"hs_v2_date_entered_qualifiedtobuy", operator:"GTE", value:String(trendSince) }
+      ], ["hs_v2_date_entered_qualifiedtobuy"]);
+      let termsSent=0;
+      for (const d of exEntered){ const t=Date.parse(d.properties.hs_v2_date_entered_qualifiedtobuy||0); const i=weekIdx(t); if (i>=0) wk.termsEx[i]++; if (t>=sinceMs) termsSent++; }
+      const coEntered = await dealSearch([
+        { propertyName:"pipeline", operator:"EQ", value:"1388416192" },
+        { propertyName:"hubspot_owner_id", operator:"EQ", value:rep.id },
+        { propertyName:"hs_v2_date_entered_1893405923", operator:"GTE", value:String(trendSince) }
+      ], ["hs_v2_date_entered_1893405923"]);
+      let termsSentCollective=0;
+      for (const d of coEntered){ const t=Date.parse(d.properties.hs_v2_date_entered_1893405923||0); const i=weekIdx(t); if (i>=0) wk.termsCo[i]++; if (t>=sinceMs) termsSentCollective++; }
+
+      ["dials","dm","pres","termsEx","termsCo"].forEach(k=>{ for(let i=0;i<TREND_WEEKS;i++) teamWk[k][i]+=wk[k][i]; });
 
       reps.push({
         name:rep.name, role:rep.role, initials:rep.initials, ...cm,
-        yesterday,
+        yesterday, today, weekly: wk,
         sourced:{ allocated, awaiting: allocated - firstTouch, overdue,
                   firstTouchPct: allocated? Math.round(firstTouch/allocated*100):0 },
         pipeline:{ deals: pipeDeals.length, forecastHammer, forecastRevenue,
                    missingHammer, missingRevenue, dealList,
-                   termsSent, termsSentPerDay: Number((termsSent/workingDays).toFixed(1)) },
+                   termsSent, termsSentCollective, termsSentPerDay: Number((termsSent/workingDays).toFixed(1)) },
         lotout: lotoutFor(rep.name, auctions, costings),
         recentCalls, noOutcomeCalls
       });
@@ -341,6 +377,7 @@ export default async (req) => {
       generated_at: new Date().toISOString(),
       period: { label:"trailing "+WINDOW_DAYS+" days", working_days:workingDays, weeks:Number(weeks.toFixed(1)) },
       targets: { companiesPerDay:25, dmPerDay:3, presPerWeek:5 },
+      trends: { weeks: weekLabels, team: teamWk },
       sourcers, reps
     });
   } catch (e){
