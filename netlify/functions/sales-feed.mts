@@ -4,9 +4,10 @@
    Activity + today/yesterday, sourced leads (14 days), hammer pipeline
    (Proposal sent, Client Exclusive, <90 days) with per-deal detail +
    missing-financial flags, LotOut costing cross-reference, terms sent
-   (Exclusive + Collective), 6-week activity trends, and Activity detail
-   with call direction. Rate-limited under HubSpot's 4/sec cap.
-   ?diagnostics=1 reports credential presence only.
+   (Exclusive + Collective), 6-week activity trends, Activity detail with
+   call direction. Rate-limited under HubSpot's 4/sec cap; result cached
+   4 min to keep the dashboard fast. ?diagnostics=1 checks credentials;
+   ?fresh=1 forces a recompute.
    ===================================================================== */
 
 const HUBSPOT_TOKEN = process.env.HUBSPOT_TOKEN;
@@ -61,6 +62,9 @@ const OUTCOME_LABELS = {
 
 const sleep = ms => new Promise(r=>setTimeout(r,ms));
 let lastStart = 0;
+let CACHE = { at:0, body:null };
+const CACHE_TTL = 240000; // serve cached payload for 4 minutes
+
 async function gate(){
   const now = Date.now();
   const wait = Math.max(0, lastStart + MIN_GAP_MS - now);
@@ -203,6 +207,9 @@ export default async (req) => {
   }
   if (!HUBSPOT_TOKEN || !SUPABASE_URL || !SUPABASE_KEY){
     return json({ error:"Missing one of HUBSPOT_TOKEN, SUPABASE_URL, SUPABASE_SERVICE_KEY" }, 500);
+  }
+  if (CACHE.body && url.searchParams.get("fresh")!=="1" && (Date.now()-CACHE.at) < CACHE_TTL){
+    return new Response(CACHE.body, { status:200, headers:{ "Content-Type":"application/json", "Cache-Control":"no-store", "Access-Control-Allow-Origin":"*", "X-Cache":"HIT" } });
   }
   try {
     const now = Date.now();
@@ -373,13 +380,16 @@ export default async (req) => {
       sourcers.push({ name:s.name, initials:s.initials, sourcedYesterday, openPool, unallocated, unallocatedOverdue });
     }
 
-    return json({
+    const payload = {
       generated_at: new Date().toISOString(),
       period: { label:"trailing "+WINDOW_DAYS+" days", working_days:workingDays, weeks:Number(weeks.toFixed(1)) },
       targets: { companiesPerDay:25, dmPerDay:3, presPerWeek:5 },
       trends: { weeks: weekLabels, team: teamWk },
       sourcers, reps
-    });
+    };
+    const bodyStr = JSON.stringify(payload);
+    CACHE = { at: Date.now(), body: bodyStr };
+    return new Response(bodyStr, { status:200, headers:{ "Content-Type":"application/json", "Cache-Control":"no-store", "Access-Control-Allow-Origin":"*", "X-Cache":"MISS" } });
   } catch (e){
     return json({ error: String((e && e.message) || e) }, 500);
   }
