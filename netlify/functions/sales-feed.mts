@@ -1,13 +1,10 @@
 /* =====================================================================
    LotOut Live Sales Report — data feed  (Netlify Function, v2 / .mts)
    Route: /.netlify/functions/sales-feed
-   Activity + today/yesterday, sourced leads (14 days), hammer pipeline
-   (Proposal sent, Client Exclusive, <90 days) with per-deal detail +
-   missing-financial flags, LotOut costing cross-reference, terms sent
-   (Exclusive + Collective), 6-week activity trends, Activity detail with
-   call direction. Rate-limited under HubSpot's 4/sec cap; result cached
-   4 min to keep the dashboard fast. ?diagnostics=1 checks credentials;
-   ?fresh=1 forces a recompute.
+   Reads Supabase auctions + costings and HubSpot calls + deals, returns
+   the dashboard JSON contract INCLUDING the Activity detail lists
+   (recentCalls + noOutcomeCalls). Rate-limited under HubSpot's 4/sec cap.
+   ?diagnostics=1 reports credential presence only.
    ===================================================================== */
 
 const HUBSPOT_TOKEN = process.env.HUBSPOT_TOKEN;
@@ -18,8 +15,8 @@ const PORTAL = "26951047";
 const WINDOW_DAYS = 14;
 const OVERDUE_AFTER_DAYS = 1;
 const MIN_GAP_MS = 300;
-const RECENT_MAX = 12;
-const NOOUT_MAX  = 15;
+const RECENT_MAX = 12;   // rows in "Activity being tracked"
+const NOOUT_MAX  = 15;   // rows in "Needs an outcome"
 
 const REPS = [
   { id:"29383896",  name:"Neil Rayner",    initials:"NR", role:"National Business Development Manager" },
@@ -63,8 +60,7 @@ const OUTCOME_LABELS = {
 const sleep = ms => new Promise(r=>setTimeout(r,ms));
 let lastStart = 0;
 let CACHE = { at:0, body:null };
-const CACHE_TTL = 240000; // serve cached payload for 4 minutes
-
+const CACHE_TTL = 240000; // serve cached payload for 4 minutes to keep the dashboard snappy
 async function gate(){
   const now = Date.now();
   const wait = Math.max(0, lastStart + MIN_GAP_MS - now);
@@ -310,26 +306,37 @@ export default async (req) => {
         if (st===STAGE_NEW_LEAD && cd < overdueCut) overdue++;
       }
 
-      // Hammer pipeline: Proposal sent (Client Exclusive), open, created within 90 days
+      // Hammer pipeline: terms sent, open, created within 90 days.
+      // Exclusive = Client Exclusive "Proposal sent"; Collective = Collective Seller "Terms Sent".
       const cut90 = now - 90*86400000;
-      const pipeDeals = await dealSearch([
+      const PIPE_PROPS = ["forecast_revenue","forecast_revenue_from_hammer","dealname"];
+      const exPipe = await dealSearch([
         { propertyName:"pipeline", operator:"EQ", value:"default" },
         { propertyName:"dealstage", operator:"EQ", value:"qualifiedtobuy" },
         { propertyName:"hs_is_closed", operator:"EQ", value:"false" },
         { propertyName:"hubspot_owner_id", operator:"EQ", value:rep.id },
         { propertyName:"createdate", operator:"GTE", value:String(cut90) }
-      ], ["forecast_revenue","forecast_revenue_from_hammer","dealname"]);
+      ], PIPE_PROPS);
+      const coPipe = await dealSearch([
+        { propertyName:"pipeline", operator:"EQ", value:"1388416192" },
+        { propertyName:"dealstage", operator:"EQ", value:"1893405923" },
+        { propertyName:"hs_is_closed", operator:"EQ", value:"false" },
+        { propertyName:"hubspot_owner_id", operator:"EQ", value:rep.id },
+        { propertyName:"createdate", operator:"GTE", value:String(cut90) }
+      ], PIPE_PROPS);
       let forecastHammer=0, forecastRevenue=0, missingHammer=0, missingRevenue=0;
       const dealList=[];
-      for (const d of pipeDeals){
+      const addDeals=(arr,type)=>{ for (const d of arr){
         const h  = Number(d.properties.forecast_revenue||0);
         const rv = Number(d.properties.forecast_revenue_from_hammer||0);
         forecastHammer += h; forecastRevenue += rv;
         if (!h)  missingHammer++;
         if (!rv) missingRevenue++;
-        dealList.push({ name: d.properties.dealname || "(unnamed deal)", hammer:h, revenue:rv,
+        dealList.push({ name: d.properties.dealname || "(unnamed deal)", type, hammer:h, revenue:rv,
           url: "https://app-eu1.hubspot.com/contacts/"+PORTAL+"/record/0-3/"+d.id });
-      }
+      } };
+      addDeals(exPipe,"Exclusive");
+      addDeals(coPipe,"Collective");
       const exEntered = await dealSearch([
         { propertyName:"pipeline", operator:"EQ", value:"default" },
         { propertyName:"hubspot_owner_id", operator:"EQ", value:rep.id },
@@ -352,7 +359,7 @@ export default async (req) => {
         yesterday, today, weekly: wk,
         sourced:{ allocated, awaiting: allocated - firstTouch, overdue,
                   firstTouchPct: allocated? Math.round(firstTouch/allocated*100):0 },
-        pipeline:{ deals: pipeDeals.length, forecastHammer, forecastRevenue,
+        pipeline:{ deals: exPipe.length + coPipe.length, forecastHammer, forecastRevenue,
                    missingHammer, missingRevenue, dealList,
                    termsSent, termsSentCollective, termsSentPerDay: Number((termsSent/workingDays).toFixed(1)) },
         lotout: lotoutFor(rep.name, auctions, costings),
