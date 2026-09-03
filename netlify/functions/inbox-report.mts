@@ -76,6 +76,19 @@ async function sbUpsert(row){
 const londonDate = ms => new Intl.DateTimeFormat("en-CA",{timeZone:"Europe/London"}).format(new Date(ms));
 const hhmm = ms => new Intl.DateTimeFormat("en-GB",{timeZone:"Europe/London",hour:"2-digit",minute:"2-digit"}).format(new Date(ms));
 function yesterdayLondon(now){ const [y,m,d]=londonDate(now).split("-").map(Number); return londonDate(Date.UTC(y,m-1,d,12)-86400000); }
+const londonDow = ms => new Intl.DateTimeFormat("en-GB",{timeZone:"Europe/London",weekday:"short"}).format(new Date(ms));
+// Reporting window: normally yesterday; on a Monday, Friday..Sunday so nothing is skipped.
+function reportWindow(now){
+  const [y,m,d]=londonDate(now).split("-").map(Number);
+  const noon = Date.UTC(y,m-1,d,12);
+  if (londonDow(now)==="Mon") return { fromDay: londonDate(noon-3*86400000), toDay: londonDate(noon-86400000) };
+  const yd = londonDate(noon-86400000);
+  return { fromDay: yd, toDay: yd };
+}
+function rangeLabel(fromDay, toDay){
+  const fmt = d => new Intl.DateTimeFormat("en-GB",{timeZone:"Europe/London",weekday:"long",day:"numeric",month:"long",year:"numeric"}).format(new Date(Date.parse(d+"T00:00:00Z")+12*3600000));
+  return fromDay===toDay ? fmt(toDay) : (fmt(fromDay).replace(/,? \d{4}$/,"")+" to "+fmt(toDay));
+}
 
 export function senderEmail(msg){
   const a = (msg.senders && msg.senders[0]) || {};
@@ -134,12 +147,12 @@ export function classify(from, subject, text, atg){
 }
 
 /* Turn one thread + its messages into either a noise hit or an enquiry record. Pure. */
-export function processThread(thread, messages, day, nowMs){
+export function processThread(thread, messages, fromDay, toDay, nowMs){
   if (thread && thread.spam) return { noise:"Spam / other" };
   const msgs = (messages||[]).filter(m=>m && m.type==="MESSAGE")
     .map(m=>({ ...m, _ts: m.createdAt ? Date.parse(m.createdAt) : 0 }))
     .sort((a,b)=>a._ts-b._ts);
-  const enquiry = msgs.find(m=>m.direction==="INCOMING" && londonDate(m._ts)===day);
+  const enquiry = msgs.find(m=>{ if(m.direction!=="INCOMING")return false; const d=londonDate(m._ts); return d>=fromDay && d<=toDay; });
   if (!enquiry) return null;
   const from = senderEmail(enquiry);
   const subject = enquiry.subject || "";
@@ -185,20 +198,23 @@ export default async (req) => {
 
   try{
     const now = Date.now();
-    const day = url.searchParams.get("date") || yesterdayLondon(now);
+    let fromDay, toDay;
+    if (url.searchParams.get("date")){ fromDay = toDay = url.searchParams.get("date"); }
+    else if (url.searchParams.get("from") && url.searchParams.get("to")){ fromDay = url.searchParams.get("from"); toDay = url.searchParams.get("to"); }
+    else { ({ fromDay, toDay } = reportWindow(now)); }
     const inbox = url.searchParams.get("inbox") || INBOX_ID;
-    const sinceISO = new Date(Date.parse(day+"T00:00:00Z") - 3*3600*1000).toISOString();
+    const sinceISO = new Date(Date.parse(fromDay+"T00:00:00Z") - 3*3600*1000).toISOString();
 
     let threads = await listThreads(inbox, sinceISO);
     threads = threads.filter(t=>{
       const rec = t.latestMessageReceivedTimestamp ? Date.parse(t.latestMessageReceivedTimestamp) : (t.latestMessageTimestamp?Date.parse(t.latestMessageTimestamp):0);
-      return rec && londonDate(rec)>=day;
+      return rec && londonDate(rec)>=fromDay;
     });
     const limit = Number(url.searchParams.get("limit")||0);
     if (limit>0) threads = threads.slice(0, limit);
 
     const processed = await mapPool(threads, async t=>{
-      try { const msgs = await getMessages(t.id); return processThread(t, msgs, day, now); }
+      try { const msgs = await getMessages(t.id); return processThread(t, msgs, fromDay, toDay, now); }
       catch(e){ return { error:String(e.message||e) }; }
     }, CONCURRENCY);
 
@@ -219,7 +235,7 @@ export default async (req) => {
 
     const noiseTotal = Object.values(noise).reduce((a,b)=>a+b,0);
     const payload = {
-      date: new Intl.DateTimeFormat("en-GB",{timeZone:"Europe/London",weekday:"long",day:"numeric",month:"long",year:"numeric"}).format(new Date(Date.parse(day+"T00:00:00Z")+12*3600000)),
+      date: rangeLabel(fromDay, toDay),
       generated_at: new Date().toISOString(),
       logged: enquiries.length + noiseTotal,
       replies:{ inbox: inbox_replies },
@@ -231,11 +247,11 @@ export default async (req) => {
     };
 
     if (url.searchParams.get("dry")==="1")
-      return json({ dry:true, report_date:day, inbox, threads_seen:threads.length,
+      return json({ dry:true, report_date:toDay, from:fromDay, to:toDay, inbox, threads_seen:threads.length,
         counts:{ logged:payload.logged, genuine:enquiries.length, actioned:enquiries.filter(e=>e.status==="actioned").length, open:enquiries.filter(e=>e.status!=="actioned").length, noise:noiseTotal }, payload });
 
-    await sbUpsert({ report_date:day, payload });
-    return json({ ok:true, report_date:day, genuine:enquiries.length, noise:noiseTotal, written:true });
+    await sbUpsert({ report_date:toDay, payload });
+    return json({ ok:true, report_date:toDay, from:fromDay, to:toDay, genuine:enquiries.length, noise:noiseTotal, written:true });
   } catch(e){
     return json({ error:String((e&&e.message)||e) },500);
   }
