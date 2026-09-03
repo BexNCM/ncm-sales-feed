@@ -10,7 +10,4 @@
   directory = "netlify/functions"
 
 [functions."inbox-report"]
-schedule = "0 8 * * *"
-
-[functions."inbox-report"]
 schedule = "0 8 * * 1-5"
