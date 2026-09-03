@@ -1,10 +1,13 @@
 /* =====================================================================
    LotOut Live Sales Report — data feed  (Netlify Function, v2 / .mts)
    Route: /.netlify/functions/sales-feed
-   Reads Supabase auctions + costings and HubSpot calls + deals, returns
-   the dashboard JSON contract INCLUDING the Activity detail lists
-   (recentCalls + noOutcomeCalls). Rate-limited under HubSpot's 4/sec cap.
-   ?diagnostics=1 reports credential presence only.
+   Activity + today/yesterday/this-week, sourced leads (14 days), hammer
+   pipeline (Exclusive Proposal-sent + Collective Terms-sent, <90 days)
+   with per-deal detail + missing-financial flags, LotOut costing
+   cross-reference, terms sent (Exclusive + Collective), 6-week activity
+   trends, Activity detail with call direction. Rate-limited under
+   HubSpot's 4/sec cap; result cached 4 min. ?diagnostics=1 checks
+   credentials; ?fresh=1 forces a recompute.
    ===================================================================== */
 
 const HUBSPOT_TOKEN = process.env.HUBSPOT_TOKEN;
@@ -15,8 +18,8 @@ const PORTAL = "26951047";
 const WINDOW_DAYS = 14;
 const OVERDUE_AFTER_DAYS = 1;
 const MIN_GAP_MS = 300;
-const RECENT_MAX = 12;   // rows in "Activity being tracked"
-const NOOUT_MAX  = 15;   // rows in "Needs an outcome"
+const RECENT_MAX = 12;
+const NOOUT_MAX  = 15;
 
 const REPS = [
   { id:"29383896",  name:"Neil Rayner",    initials:"NR", role:"National Business Development Manager" },
@@ -60,7 +63,7 @@ const OUTCOME_LABELS = {
 const sleep = ms => new Promise(r=>setTimeout(r,ms));
 let lastStart = 0;
 let CACHE = { at:0, body:null };
-const CACHE_TTL = 240000; // serve cached payload for 4 minutes to keep the dashboard snappy
+const CACHE_TTL = 240000; // serve cached payload for 4 minutes
 async function gate(){
   const now = Date.now();
   const wait = Math.max(0, lastStart + MIN_GAP_MS - now);
@@ -354,9 +357,15 @@ export default async (req) => {
 
       ["dials","dm","pres","termsEx","termsCo"].forEach(k=>{ for(let i=0;i<TREND_WEEKS;i++) teamWk[k][i]+=wk[k][i]; });
 
+      // This week's totals (Monday to now) for the weekly report
+      const _li = TREND_WEEKS-1;
+      const _wCo = new Set();
+      for (const c of calls){ if (c.ts>=thisWeekStart){ const co=companyMap[c.id]; if (co) _wCo.add(co); } }
+      const thisWeek = { companies:_wCo.size, dials:wk.dials[_li], dm:wk.dm[_li], presentations:wk.pres[_li], termsEx:wk.termsEx[_li], termsCo:wk.termsCo[_li] };
+
       reps.push({
         name:rep.name, role:rep.role, initials:rep.initials, ...cm,
-        yesterday, today, weekly: wk,
+        yesterday, today, thisWeek, weekly: wk,
         sourced:{ allocated, awaiting: allocated - firstTouch, overdue,
                   firstTouchPct: allocated? Math.round(firstTouch/allocated*100):0 },
         pipeline:{ deals: exPipe.length + coPipe.length, forecastHammer, forecastRevenue,
