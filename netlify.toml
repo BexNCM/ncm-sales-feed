@@ -8,3 +8,6 @@
 
 [functions]
   directory = "netlify/functions"
+
+[functions."inbox-report"]
+schedule = "0 8 * * *"
