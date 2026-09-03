@@ -1,9 +1,9 @@
 /* =====================================================================
-   LotOut Inbox Report — data feed  (Netlify Function, .mts)  v2 Conversations
+   LotOut Inbox Report — data feed  (Netlify Function, .mts)  v3 Conversations
    Route: /.netlify/functions/inbox-report
    Reads the HubSpot Conversations inbox (scope: conversations.read), strips
-   noise, parses i-bidder / BidSpotter enquiries, classifies the rest, works
-   out received vs responded from the thread's own messages, and upserts ONE
+   noise, parses i-bidder / BidSpotter enquiries, classifies the rest, and
+   reports what's been ACTIONED (thread closed) vs still OPEN. Upserts ONE
    row into Supabase public.inbox_reports (one per day).
      ?diagnostics=1  -> credential presence only
      ?inboxes=1      -> list your conversations inboxes (to confirm INBOX_ID)
@@ -17,11 +17,10 @@ const HUBSPOT_TOKEN = process.env.HUBSPOT_TOKEN;
 const SUPABASE_URL  = process.env.SUPABASE_URL;
 const SUPABASE_KEY  = process.env.SUPABASE_SERVICE_KEY;
 
-const INBOX_ID = "21225792719";   // the shared email inbox (from your live-messages URL). Confirm with ?inboxes=1
+const INBOX_ID = "228812790";   // Info Inbox (the info@ shared mailbox). Confirm with ?inboxes=1
 const CONCURRENCY = 6;
 const OVERDUE_DAYS = 3;
 
-// agent actor "A-<userId>" -> person. Same HubSpot user ids as the sent-email analysis.
 const USER_BY_ID = {
   "78639512":"Elliot Corney","51982711":"Anthony Worth","51110999":"Emma Humble",
   "51108339":"Amy Rutherford","65901157":"Ross Gilfillan","29383896":"Neil Rayner","50019395":"Andy Smith"
@@ -103,14 +102,23 @@ export function parseATG(subject, text){
 export function noiseBucket(from, subject){
   const f=(from||"").toLowerCase(), s=(subject||"").toLowerCase();
   if (f.includes("googlealerts")) return "Google Alerts";
-  if (s.includes("auction approved") || ((f.includes("bidspotter")||f.includes("i-bidder")) && !s.includes("enquiry") && (s.includes("approved")||s.includes("registration")))) return "Auction \"approved\"";
   if (f.includes("linkedin.com")) return "LinkedIn";
+  if (s.includes("auction approved") || ((f.includes("bidspotter")||f.includes("i-bidder")) && !s.includes("enquiry") && (s.includes("approved")||s.includes("registration")))) return "Auction \"approved\"";
   if (/^(automatic reply|out of office|auto)/i.test(s) || s.includes("automatic reply")) return "Auto-replies/bounces";
   if (s.includes("undeliverable")||s.includes("delivery status")||s.includes("mail delivery")||f.includes("mailer-daemon")||f.includes("postmaster")) return "Auto-replies/bounces";
-  if (f.includes("find-a-tender")||f.includes("find a tender")||f.includes("due-north")||f.includes("proactis")||f.includes("in-tend")||f.includes("coupa")||f.includes("procontract")||s.includes("tender")) return "Tender/procurement";
-  if (f.includes("newsletter")||f.includes("noreply@")||f.includes("no-reply@")||f.includes("mailchimp")||f.includes("news@")||f.includes("marketing@")) return "Newsletters/marketing";
+  if (f.includes("onmicrosoft")||f.includes("microsoftexchange")||s.includes("mailbox is almost full")||s.includes("mailbox is full")||s.includes("quarantine")||s.includes("storage limit")||s.includes("password")) return "System / mailbox";
+  if (f.includes("govdelivery")||f.includes("find-a-tender")||f.includes("find a tender")||f.includes("due-north")||f.includes("proactis")||f.includes("in-tend")||f.includes("coupa")||f.includes("procontract")||s.includes("tender")||s.includes("funding opportunit")) return "Tender/procurement";
+  if (f.endsWith("@ebay.com")||f.includes("@ebay.")||f.includes("paypal")||f.includes("@amazon")||f.includes("stripe.com")) return "Marketplace/platform";
+  if (f.includes("pressxchange")||f.includes("newsletter")||f.includes("noreply")||f.includes("no-reply")||f.includes("donotreply")||f.includes("mailchimp")||f.includes("news@")||f.includes("marketing@")||f.includes("@hubspot")||s.includes("newsletter")||s.includes("webinar")||s.includes("unsubscribe")||s.includes("can help drive")) return "Newsletters/marketing";
+  if ((f.includes("statements@")||f.includes("billing@")||f.includes("accounts@")) && (s.includes("statement")||s.includes("invoice ready")||s.includes("summary"))) return "Statements (auto)";
   if (/[\u{1D400}-\u{1D7FF}]/u.test((subject||"")+" "+s)) return "Spam / other";
   return null;
+}
+// human-signal gate: stops system/marketing mail sitting in the "partnership" fallback
+export function looksHuman(from, text){
+  const f=(from||"").toLowerCase(), t=(text||"");
+  if (/no-?reply|noreply|donotreply|do-not-reply|notification|notifications@|mailer|postmaster|govdelivery|onmicrosoft|@ebay\.|automated|@hubspot|mailchimp/.test(f)) return false;
+  return /\b(hi|hello|dear|thanks|thank you|regards|please|could you|can you|we (have|are|would|'re)|i (am|would|have|'m|'ve)|interested)\b|\?/i.test(t);
 }
 export function classify(from, subject, text, atg){
   if (atg) return "buyer";
@@ -124,15 +132,14 @@ export function classify(from, subject, text, atg){
   return "partnership";
 }
 
-/* Turn one thread + its messages into either a noise hit or an enquiry record.
-   Pure and unit-testable. */
+/* Turn one thread + its messages into either a noise hit or an enquiry record. Pure. */
 export function processThread(thread, messages, day, nowMs){
   if (thread && thread.spam) return { noise:"Spam / other" };
   const msgs = (messages||[]).filter(m=>m && m.type==="MESSAGE")
     .map(m=>({ ...m, _ts: m.createdAt ? Date.parse(m.createdAt) : 0 }))
     .sort((a,b)=>a._ts-b._ts);
   const enquiry = msgs.find(m=>m.direction==="INCOMING" && londonDate(m._ts)===day);
-  if (!enquiry) return null; // nothing received that day
+  if (!enquiry) return null;
   const from = senderEmail(enquiry);
   const subject = enquiry.subject || "";
   const text = enquiry.text || "";
@@ -141,10 +148,13 @@ export function processThread(thread, messages, day, nowMs){
 
   const atg = parseATG(subject, text);
   const cat = classify(from, subject, text, atg);
+  if (cat==="partnership" && !looksHuman(from, text)) return { noise:"Other / non-enquiry" };
+
+  // "dealt with" = the team closed the thread once actioned (phone, booking, or reply)
   const reply = msgs.find(m=>m.direction==="OUTGOING" && m._ts > enquiry._ts);
   const handler = reply ? personFromActor(reply.senders && reply.senders[0] && reply.senders[0].actorId) : "—";
-  let status = reply ? "responded" : "open";
-  if (!reply && cat==="complaint" && (nowMs-enquiry._ts)/86400000 > OVERDUE_DAYS) status = "overdue";
+  let status = (thread.status==="CLOSED") ? "actioned" : "open";
+  if (status==="open" && (nowMs-enquiry._ts)/86400000 > OVERDUE_DAYS) status = "overdue";
 
   return { enquiry:{
     id: thread.id, cat,
@@ -179,10 +189,9 @@ export default async (req) => {
     const sinceISO = new Date(Date.parse(day+"T00:00:00Z") - 3*3600*1000).toISOString();
 
     let threads = await listThreads(inbox, sinceISO);
-    // only threads that actually received something on the day (cheap pre-filter)
     threads = threads.filter(t=>{
       const rec = t.latestMessageReceivedTimestamp ? Date.parse(t.latestMessageReceivedTimestamp) : (t.latestMessageTimestamp?Date.parse(t.latestMessageTimestamp):0);
-      return rec && londonDate(rec)>=day;   // received on/after the day
+      return rec && londonDate(rec)>=day;
     });
     const limit = Number(url.searchParams.get("limit")||0);
     if (limit>0) threads = threads.slice(0, limit);
@@ -199,13 +208,13 @@ export default async (req) => {
       if (p.enquiry) enquiries.push(p.enquiry);
     }
     const inbox_replies={};
-    for (const e of enquiries) if (e.status==="responded" && e.handler!=="—") inbox_replies[e.handler]=(inbox_replies[e.handler]||0)+1;
+    for (const e of enquiries) if (e.handler && e.handler!=="—") inbox_replies[e.handler]=(inbox_replies[e.handler]||0)+1;
 
     const quality=[];
-    for (const q of enquiries.filter(x=>x.status==="overdue")) quality.push(["&#9873;","<b>"+q.who+"</b> — "+CAT_LABELS[q.cat]+" open "+OVERDUE_DAYS+"+ days. "+(q.summary||"")]);
+    for (const q of enquiries.filter(x=>x.status==="overdue")) quality.push(["&#9873;","<b>"+q.who+"</b> — "+CAT_LABELS[q.cat]+" open "+OVERDUE_DAYS+"+ days. "+(q.summary||"").slice(0,120)]);
     const nameless = enquiries.filter(x=>x.lot && x.buyerName && x.buyerEmail);
     if (nameless.length) quality.push(["&#9888;", nameless.length+" i-bidder/BidSpotter buyer(s) arrived with name + phone in the enquiry — check the CRM contact captured them (auto-fix is v2)."]);
-    for (const q of enquiries.filter(x=>x.status==="open" && x.cat!=="complaint").slice(0,6)) quality.push(["&#9888;","<b>"+q.who+"</b> ("+CAT_LABELS[q.cat]+", "+q.time+") — no reply on the thread. Check it was handled."]);
+    for (const q of enquiries.filter(x=>x.status==="open").slice(0,6)) quality.push(["&#9888;","<b>"+q.who+"</b> ("+CAT_LABELS[q.cat]+", "+q.time+") — still open (not actioned). Check it gets dealt with."]);
 
     const noiseTotal = Object.values(noise).reduce((a,b)=>a+b,0);
     const payload = {
@@ -213,7 +222,7 @@ export default async (req) => {
       generated_at: new Date().toISOString(),
       logged: enquiries.length + noiseTotal,
       replies:{ inbox: inbox_replies },
-      outreach:{},   // not derivable from the shared inbox; outreach goes from individual addresses
+      outreach:{},
       noise: Object.entries(noise).sort((a,b)=>b[1]-a[1]),
       quality,
       cats: Object.fromEntries(Object.keys(CAT_LABELS).map(k=>[k,{label:CAT_LABELS[k]}])),
@@ -222,7 +231,7 @@ export default async (req) => {
 
     if (url.searchParams.get("dry")==="1")
       return json({ dry:true, report_date:day, inbox, threads_seen:threads.length,
-        counts:{ logged:payload.logged, genuine:enquiries.length, responded:enquiries.filter(e=>e.status==="responded").length, open:enquiries.filter(e=>e.status!=="responded").length, noise:noiseTotal }, payload });
+        counts:{ logged:payload.logged, genuine:enquiries.length, actioned:enquiries.filter(e=>e.status==="actioned").length, open:enquiries.filter(e=>e.status!=="actioned").length, noise:noiseTotal }, payload });
 
     await sbUpsert({ report_date:day, payload });
     return json({ ok:true, report_date:day, genuine:enquiries.length, noise:noiseTotal, written:true });
