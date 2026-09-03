@@ -99,8 +99,8 @@ export function parseATG(subject, text){
   const message = (t.match(/\bMessage\s+([\s\S]+?)(?:\s*Please add\b|\s*Metropress\b|$)/i))?.[1]?.trim() || null;
   return { platform, lot, buyerEmail:email, buyerName:name, buyerPhone:phone, message };
 }
-export function noiseBucket(from, subject){
-  const f=(from||"").toLowerCase(), s=(subject||"").toLowerCase();
+export function noiseBucket(from, subject, text){
+  const f=(from||"").toLowerCase(), s=(subject||"").toLowerCase(), b=(text||"").toLowerCase();
   if (f.includes("googlealerts")) return "Google Alerts";
   if (f.includes("linkedin.com")) return "LinkedIn";
   if (s.includes("auction approved") || ((f.includes("bidspotter")||f.includes("i-bidder")) && !s.includes("enquiry") && (s.includes("approved")||s.includes("registration")))) return "Auction \"approved\"";
@@ -108,10 +108,11 @@ export function noiseBucket(from, subject){
   if (s.includes("undeliverable")||s.includes("delivery status")||s.includes("mail delivery")||f.includes("mailer-daemon")||f.includes("postmaster")) return "Auto-replies/bounces";
   if (f.includes("onmicrosoft")||f.includes("microsoftexchange")||s.includes("mailbox is almost full")||s.includes("mailbox is full")||s.includes("quarantine")||s.includes("storage limit")||s.includes("password")) return "System / mailbox";
   if (f.includes("govdelivery")||f.includes("find-a-tender")||f.includes("find a tender")||f.includes("due-north")||f.includes("proactis")||f.includes("in-tend")||f.includes("coupa")||f.includes("procontract")||s.includes("tender")||s.includes("funding opportunit")) return "Tender/procurement";
-  if (f.endsWith("@ebay.com")||f.includes("@ebay.")||f.includes("paypal")||f.includes("@amazon")||f.includes("stripe.com")) return "Marketplace/platform";
+  if (f.includes("ebay.")||f.includes("paypal")||f.includes("@amazon")||f.includes("stripe.com")||s.includes("seller news")) return "Marketplace/platform";
   if (f.includes("pressxchange")||f.includes("newsletter")||f.includes("noreply")||f.includes("no-reply")||f.includes("donotreply")||f.includes("mailchimp")||f.includes("news@")||f.includes("marketing@")||f.includes("@hubspot")||s.includes("newsletter")||s.includes("webinar")||s.includes("unsubscribe")||s.includes("can help drive")) return "Newsletters/marketing";
+  if (b.includes("unsubscribe")||b.includes("view in browser")||b.includes("view this email")||b.includes("manage preferences")||b.includes("you received this email")||b.includes("no longer wish to receive")||b.includes("testflight")||b.includes("now open for pre")) return "Newsletters/marketing";
   if ((f.includes("statements@")||f.includes("billing@")||f.includes("accounts@")) && (s.includes("statement")||s.includes("invoice ready")||s.includes("summary"))) return "Statements (auto)";
-  if (/[\u{1D400}-\u{1D7FF}]/u.test((subject||"")+" "+s)) return "Spam / other";
+  if (/[\u{1D400}-\u{1D7FF}]/u.test((subject||"")+" "+(text||""))) return "Spam / other";
   return null;
 }
 // human-signal gate: stops system/marketing mail sitting in the "partnership" fallback
@@ -123,12 +124,12 @@ export function looksHuman(from, text){
 export function classify(from, subject, text, atg){
   if (atg) return "buyer";
   const blob=((subject||"")+" "+(text||"")).toLowerCase();
-  if (/wrong item|missing|damaged|refund|complaint|not as (described|pictured)/.test(blob)) return "complaint";
-  if (/collection|collect|rams|collected|au1\d{4}/.test(blob)) return "collection";
+  if (/wrong item|missing|damaged|refund|reimburse|complaint|not as (described|pictured)|return(ed)? the funds|not returned|deal with this urgently/.test(blob)) return "complaint";
+  if (/collection|collect|rams|collected/.test(blob)) return "collection";
   if (/invoice|statement|payment|paid|figures|buyer number|remittance/.test(blob)) return "payment";
-  if (/viewing|view this|view the|arrange a view/.test(blob)) return "viewing";
-  if (/asset disposal|surplus|site closure|relocation|clearance|sell (our|my|the)|dispose|liquidat|furniture|plant equipment|release value|assets to/.test(blob)) return "seller";
-  if (/lot\s+\d+|enquiry re lot|is (it|this) working|reserve|condition|bid on/.test(blob)) return "buyer";
+  if (/viewing|view this lot|view the lot|arrange a view|come and view|book a view/.test(blob)) return "viewing";
+  if (/asset disposal|surplus|site closure|relocation|clearance|sell (our|my|the)|to sell|for sale|selling|dispose|liquidat|furniture|plant equipment|release value|assets to/.test(blob)) return "seller";
+  if (/lot\s*[№#]?\s*\d+|enquiry re lot|is (it|this) working|working\?|reserve|condition|bid on|interested in (this|the)?\s?item|flat pack|does it (include|come|have)/.test(blob)) return "buyer";
   return "partnership";
 }
 
@@ -143,7 +144,7 @@ export function processThread(thread, messages, day, nowMs){
   const from = senderEmail(enquiry);
   const subject = enquiry.subject || "";
   const text = enquiry.text || "";
-  const nb = noiseBucket(from, subject);
+  const nb = noiseBucket(from, subject, text);
   if (nb) return { noise:nb };
 
   const atg = parseATG(subject, text);
