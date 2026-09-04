@@ -1,13 +1,14 @@
 /* =====================================================================
    LotOut Live Sales Report — data feed  (Netlify Function, v2 / .mts)
    Route: /.netlify/functions/sales-feed
-   Activity + today/yesterday/this-week, sourced leads (14 days), hammer
-   pipeline (Exclusive Proposal-sent + Collective Terms-sent, <90 days)
-   with per-deal detail + missing-financial flags, LotOut costing
-   cross-reference, terms sent (Exclusive + Collective), 6-week activity
-   trends, Activity detail with call direction. Rate-limited under
-   HubSpot's 4/sec cap; result cached 4 min. ?diagnostics=1 checks
-   credentials; ?fresh=1 forces a recompute.
+   Per-rep activity vs prorated targets (part-time weeks supported),
+   today/yesterday/this-week, sourced leads (14 days), hammer pipeline
+   (Exclusive Proposal-sent + Collective Terms-sent, <90 days) with
+   per-deal detail + missing-financial flags, LotOut costing
+   cross-reference, terms sent (Exclusive + Collective), 6-week trends,
+   Activity detail with call direction. Rate-limited under HubSpot's
+   4/sec cap; result cached 4 min. ?diagnostics=1 checks credentials;
+   ?fresh=1 forces a recompute.
    ===================================================================== */
 
 const HUBSPOT_TOKEN = process.env.HUBSPOT_TOKEN;
@@ -22,9 +23,9 @@ const RECENT_MAX = 12;
 const NOOUT_MAX  = 15;
 
 const REPS = [
-  { id:"29383896",  name:"Neil Rayner",    initials:"NR", role:"National Business Development Manager" },
-  { id:"896985590", name:"Amy Rutherford", initials:"AR", role:"Partnerships Lead" },
-  { id:"897221581", name:"Emma Humble",    initials:"EH", role:"Head of Partnerships" }
+  { id:"29383896",  name:"Neil Rayner",    initials:"NR", role:"National Business Development Manager", daysPerWeek:5, offWeekday:null },
+  { id:"896985590", name:"Amy Rutherford", initials:"AR", role:"Partnerships Lead", daysPerWeek:5, offWeekday:null },
+  { id:"897221581", name:"Emma Humble",    initials:"EH", role:"Head of Partnerships", daysPerWeek:4, offWeekday:5 }
 ];
 const SOURCERS = [
   { id:"1883899423", name:"Ross Gilfillan", initials:"RG" },
@@ -70,9 +71,9 @@ async function gate(){
   lastStart = now + wait;
   if (wait) await sleep(wait);
 }
-function workingDaysBetween(from, to){
+function workingDaysBetween(from, to, off){
   let d = new Date(from), n = 0;
-  while (d < to){ const w = d.getUTCDay(); if (w!==0 && w!==6) n++; d = new Date(d.getTime()+86400000); }
+  while (d < to){ const w = d.getUTCDay(); if (w!==0 && w!==6 && w!==off) n++; d = new Date(d.getTime()+86400000); }
   return Math.max(n,1);
 }
 function startOfUTCDay(ms){ const d=new Date(ms); return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()); }
@@ -246,7 +247,9 @@ export default async (req) => {
       const callsAll = await callsForOwner(rep.id, trendSince, now);
       const calls = callsAll.filter(c=>c.ts>=sinceMs);
       const companyMap = await assocMap(calls.map(c=>c.id), "companies");
-      const cm = callMetrics(calls, companyMap, workingDays, weeks);
+      const repWorkingDays = workingDaysBetween(sinceMs, now, rep.offWeekday);
+      const repWeeks = repWorkingDays / rep.daysPerWeek;
+      const cm = callMetrics(calls, companyMap, repWorkingDays, repWeeks);
 
       // Yesterday's activity (previous working day) and today so far, from the same calls
       let yDials=0, yDm=0, yPres=0; const yCo=new Set();
@@ -306,107 +309,4 @@ export default async (req) => {
         const st = d.properties.dealstage;
         const cd = d.properties.createdate ? Date.parse(d.properties.createdate) : 0;
         if (st===STAGE_FIRST_TOUCH) firstTouch++;
-        if (st===STAGE_NEW_LEAD && cd < overdueCut) overdue++;
-      }
-
-      // Hammer pipeline: terms sent, open, created within 90 days.
-      // Exclusive = Client Exclusive "Proposal sent"; Collective = Collective Seller "Terms Sent".
-      const cut90 = now - 90*86400000;
-      const PIPE_PROPS = ["forecast_revenue","forecast_revenue_from_hammer","dealname"];
-      const exPipe = await dealSearch([
-        { propertyName:"pipeline", operator:"EQ", value:"default" },
-        { propertyName:"dealstage", operator:"EQ", value:"qualifiedtobuy" },
-        { propertyName:"hs_is_closed", operator:"EQ", value:"false" },
-        { propertyName:"hubspot_owner_id", operator:"EQ", value:rep.id },
-        { propertyName:"createdate", operator:"GTE", value:String(cut90) }
-      ], PIPE_PROPS);
-      const coPipe = await dealSearch([
-        { propertyName:"pipeline", operator:"EQ", value:"1388416192" },
-        { propertyName:"dealstage", operator:"EQ", value:"1893405923" },
-        { propertyName:"hs_is_closed", operator:"EQ", value:"false" },
-        { propertyName:"hubspot_owner_id", operator:"EQ", value:rep.id },
-        { propertyName:"createdate", operator:"GTE", value:String(cut90) }
-      ], PIPE_PROPS);
-      let forecastHammer=0, forecastRevenue=0, missingHammer=0, missingRevenue=0;
-      const dealList=[];
-      const addDeals=(arr,type)=>{ for (const d of arr){
-        const h  = Number(d.properties.forecast_revenue||0);
-        const rv = Number(d.properties.forecast_revenue_from_hammer||0);
-        forecastHammer += h; forecastRevenue += rv;
-        if (!h)  missingHammer++;
-        if (!rv) missingRevenue++;
-        dealList.push({ name: d.properties.dealname || "(unnamed deal)", type, hammer:h, revenue:rv,
-          url: "https://app-eu1.hubspot.com/contacts/"+PORTAL+"/record/0-3/"+d.id });
-      } };
-      addDeals(exPipe,"Exclusive");
-      addDeals(coPipe,"Collective");
-      const exEntered = await dealSearch([
-        { propertyName:"pipeline", operator:"EQ", value:"default" },
-        { propertyName:"hubspot_owner_id", operator:"EQ", value:rep.id },
-        { propertyName:"hs_v2_date_entered_qualifiedtobuy", operator:"GTE", value:String(trendSince) }
-      ], ["hs_v2_date_entered_qualifiedtobuy"]);
-      let termsSent=0;
-      for (const d of exEntered){ const t=Date.parse(d.properties.hs_v2_date_entered_qualifiedtobuy||0); const i=weekIdx(t); if (i>=0) wk.termsEx[i]++; if (t>=sinceMs) termsSent++; }
-      const coEntered = await dealSearch([
-        { propertyName:"pipeline", operator:"EQ", value:"1388416192" },
-        { propertyName:"hubspot_owner_id", operator:"EQ", value:rep.id },
-        { propertyName:"hs_v2_date_entered_1893405923", operator:"GTE", value:String(trendSince) }
-      ], ["hs_v2_date_entered_1893405923"]);
-      let termsSentCollective=0;
-      for (const d of coEntered){ const t=Date.parse(d.properties.hs_v2_date_entered_1893405923||0); const i=weekIdx(t); if (i>=0) wk.termsCo[i]++; if (t>=sinceMs) termsSentCollective++; }
-
-      ["dials","dm","pres","termsEx","termsCo"].forEach(k=>{ for(let i=0;i<TREND_WEEKS;i++) teamWk[k][i]+=wk[k][i]; });
-
-      // This week's totals (Monday to now) for the weekly report
-      const _li = TREND_WEEKS-1;
-      const _wCo = new Set();
-      for (const c of calls){ if (c.ts>=thisWeekStart){ const co=companyMap[c.id]; if (co) _wCo.add(co); } }
-      const thisWeek = { companies:_wCo.size, dials:wk.dials[_li], dm:wk.dm[_li], presentations:wk.pres[_li], termsEx:wk.termsEx[_li], termsCo:wk.termsCo[_li] };
-
-      reps.push({
-        name:rep.name, role:rep.role, initials:rep.initials, ...cm,
-        yesterday, today, thisWeek, weekly: wk,
-        sourced:{ allocated, awaiting: allocated - firstTouch, overdue,
-                  firstTouchPct: allocated? Math.round(firstTouch/allocated*100):0 },
-        pipeline:{ deals: exPipe.length + coPipe.length, forecastHammer, forecastRevenue,
-                   missingHammer, missingRevenue, dealList,
-                   termsSent, termsSentCollective, termsSentPerDay: Number((termsSent/workingDays).toFixed(1)) },
-        lotout: lotoutFor(rep.name, auctions, costings),
-        recentCalls, noOutcomeCalls
-      });
-    }
-
-    const sourcers = [];
-    for (const s of SOURCERS){
-      const base = [{ propertyName:"sourced_by", operator:"EQ", value:s.id }];
-      const sourcedYesterday = await dealCount([...base,
-        { propertyName:"createdate", operator:"GTE", value:String(yStart) },
-        { propertyName:"createdate", operator:"LT",  value:String(yEnd) }]);
-      const openPool = await dealCount([...base, { propertyName:"createdate", operator:"GTE", value:String(sinceMs) }]);
-      const own = await dealSearch([...base,
-        { propertyName:"hubspot_owner_id", operator:"EQ", value:s.id },
-        { propertyName:"hs_is_closed", operator:"EQ", value:"false" }], ["dealstage","createdate"]);
-      let unallocated = own.length, unallocatedOverdue = 0;
-      for (const d of own){
-        if (d.properties.dealstage===STAGE_NEW_LEAD){
-          const cd = d.properties.createdate ? Date.parse(d.properties.createdate) : 0;
-          if (cd < overdueCut) unallocatedOverdue++;
-        }
-      }
-      sourcers.push({ name:s.name, initials:s.initials, sourcedYesterday, openPool, unallocated, unallocatedOverdue });
-    }
-
-    const payload = {
-      generated_at: new Date().toISOString(),
-      period: { label:"trailing "+WINDOW_DAYS+" days", working_days:workingDays, weeks:Number(weeks.toFixed(1)) },
-      targets: { companiesPerDay:25, dmPerDay:3, presPerWeek:5 },
-      trends: { weeks: weekLabels, team: teamWk },
-      sourcers, reps
-    };
-    const bodyStr = JSON.stringify(payload);
-    CACHE = { at: Date.now(), body: bodyStr };
-    return new Response(bodyStr, { status:200, headers:{ "Content-Type":"application/json", "Cache-Control":"no-store", "Access-Control-Allow-Origin":"*", "X-Cache":"MISS" } });
-  } catch (e){
-    return json({ error: String((e && e.message) || e) }, 500);
-  }
-};
+        if (st===STAGE_NEW_LEAD && cd
