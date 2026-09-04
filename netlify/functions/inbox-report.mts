@@ -1,23 +1,17 @@
 /* =====================================================================
-   LotOut Inbox Report — data feed  (Netlify Function, .mts)  v3 Conversations
-   Route: /.netlify/functions/inbox-report
-   Reads the HubSpot Conversations inbox (scope: conversations.read), strips
-   noise, parses i-bidder / BidSpotter enquiries, classifies the rest, and
-   reports what's been ACTIONED (thread closed) vs still OPEN. Upserts ONE
-   row into Supabase public.inbox_reports (one per day).
-     ?diagnostics=1  -> credential presence only
-     ?inboxes=1      -> list your conversations inboxes (to confirm INBOX_ID)
-     ?dry=1          -> return payload WITHOUT writing (add &limit=40 to test fast)
-     ?date=YYYY-MM-DD-> run for a specific day (default: yesterday, London)
-     ?inbox=<id>     -> override inbox (default INBOX_ID below)
-   Read-only. Does not write back to the CRM.
+   LotOut Inbox Report — data feed  (Netlify Function, .mts)  v4 Conversations
+   Demand (genuine enquiries received) + Activity (what each person did in
+   the inbox, split customer-reply vs admin). Reads HubSpot Conversations
+   (scope: conversations.read); upserts one row/day into public.inbox_reports.
+     ?diagnostics=1  ?inboxes=1  ?dry=1(&limit=40)  ?date=YYYY-MM-DD  ?inbox=<id>
+   Read-only. Note: outbound BD (from individual addresses) isn't in this inbox.
    ===================================================================== */
 
 const HUBSPOT_TOKEN = process.env.HUBSPOT_TOKEN;
 const SUPABASE_URL  = process.env.SUPABASE_URL;
 const SUPABASE_KEY  = process.env.SUPABASE_SERVICE_KEY;
 
-const INBOX_ID = "228812790";   // Info Inbox (the info@ shared mailbox). Confirm with ?inboxes=1
+const INBOX_ID = "228812790";   // Info Inbox. Confirm with ?inboxes=1
 const CONCURRENCY = 6;
 const OVERDUE_DAYS = 3;
 
@@ -31,7 +25,6 @@ const CAT_LABELS = {
 };
 
 const sleep = ms => new Promise(r=>setTimeout(r,ms));
-
 async function hsGet(path){
   for (let a=0; a<6; a++){
     const r = await fetch("https://api.hubapi.com"+path, { headers:{ Authorization:"Bearer "+HUBSPOT_TOKEN } });
@@ -75,9 +68,7 @@ async function sbUpsert(row){
 // ---- pure helpers ----
 const londonDate = ms => new Intl.DateTimeFormat("en-CA",{timeZone:"Europe/London"}).format(new Date(ms));
 const hhmm = ms => new Intl.DateTimeFormat("en-GB",{timeZone:"Europe/London",hour:"2-digit",minute:"2-digit"}).format(new Date(ms));
-function yesterdayLondon(now){ const [y,m,d]=londonDate(now).split("-").map(Number); return londonDate(Date.UTC(y,m-1,d,12)-86400000); }
 const londonDow = ms => new Intl.DateTimeFormat("en-GB",{timeZone:"Europe/London",weekday:"short"}).format(new Date(ms));
-// Reporting window: normally yesterday; on a Monday, Friday..Sunday so nothing is skipped.
 function reportWindow(now){
   const [y,m,d]=londonDate(now).split("-").map(Number);
   const noon = Date.UTC(y,m-1,d,12);
@@ -89,7 +80,6 @@ function rangeLabel(fromDay, toDay){
   const fmt = d => new Intl.DateTimeFormat("en-GB",{timeZone:"Europe/London",weekday:"long",day:"numeric",month:"long",year:"numeric"}).format(new Date(Date.parse(d+"T00:00:00Z")+12*3600000));
   return fromDay===toDay ? fmt(toDay) : (fmt(fromDay).replace(/,? \d{4}$/,"")+" to "+fmt(toDay));
 }
-
 export function senderEmail(msg){
   const a = (msg.senders && msg.senders[0]) || {};
   if (typeof a.actorId==="string" && a.actorId.startsWith("E-")) return a.actorId.slice(2).toLowerCase();
@@ -128,7 +118,6 @@ export function noiseBucket(from, subject, text){
   if (/[\u{1D400}-\u{1D7FF}]/u.test((subject||"")+" "+(text||""))) return "Spam / other";
   return null;
 }
-// human-signal gate: stops system/marketing mail sitting in the "partnership" fallback
 export function looksHuman(from, text){
   const f=(from||"").toLowerCase(), t=(text||"");
   if (/no-?reply|noreply|donotreply|do-not-reply|notification|notifications@|mailer|postmaster|govdelivery|onmicrosoft|@ebay\.|automated|@hubspot|mailchimp/.test(f)) return false;
@@ -146,42 +135,74 @@ export function classify(from, subject, text, atg){
   return "partnership";
 }
 
-/* Turn one thread + its messages into either a noise hit or an enquiry record. Pure. */
+/* Returns { noise, enquiry, activity[] } for one thread.
+   - thread classified genuine/noise from its first inbound (or outbound-started => admin)
+   - noise/enquiry only counted for an inbound RECEIVED in-window (the day's demand)
+   - activity = every OUTGOING message sent in-window, tagged customer (genuine thread) vs admin */
 export function processThread(thread, messages, fromDay, toDay, nowMs){
-  if (thread && thread.spam) return { noise:"Spam / other" };
+  const spam = !!(thread && thread.spam);
   const msgs = (messages||[]).filter(m=>m && m.type==="MESSAGE")
     .map(m=>({ ...m, _ts: m.createdAt ? Date.parse(m.createdAt) : 0 }))
     .sort((a,b)=>a._ts-b._ts);
-  const enquiry = msgs.find(m=>{ if(m.direction!=="INCOMING")return false; const d=londonDate(m._ts); return d>=fromDay && d<=toDay; });
-  if (!enquiry) return null;
-  const from = senderEmail(enquiry);
-  const subject = enquiry.subject || "";
-  const text = enquiry.text || "";
-  const nb = noiseBucket(from, subject, text);
-  if (nb) return { noise:nb };
+  if (!msgs.length) return null;
+  const inWin = d => d>=fromDay && d<=toDay;
 
-  const atg = parseATG(subject, text);
-  const cat = classify(from, subject, text, atg);
-  if (cat==="partnership" && !looksHuman(from, text)) return { noise:"Other / non-enquiry" };
+  // classify the whole thread from its first inbound
+  const firstIn = msgs.find(m=>m.direction==="INCOMING");
+  let genuine=false, threadCat=null, threadSubj=(firstIn&&firstIn.subject)||"";
+  if (!spam && firstIn){
+    const f=senderEmail(firstIn), fs=firstIn.subject||"", ft=firstIn.text||"";
+    if (!noiseBucket(f,fs,ft)){
+      const atg=parseATG(fs,ft), c=classify(f,fs,ft,atg);
+      if (!(c==="partnership" && !looksHuman(f,ft))){ genuine=true; threadCat=c; }
+    }
+  }
 
-  // "dealt with" = the team closed the thread once actioned (phone, booking, or reply)
-  const reply = msgs.find(m=>m.direction==="OUTGOING" && m._ts > enquiry._ts);
-  const handler = reply ? personFromActor(reply.senders && reply.senders[0] && reply.senders[0].actorId) : "—";
-  let status = (thread.status==="CLOSED") ? "actioned" : "open";
-  if (status==="open" && (nowMs-enquiry._ts)/86400000 > OVERDUE_DAYS) status = "overdue";
+  // ACTIVITY — outgoing messages sent in-window
+  const activity=[];
+  for (const m of msgs){
+    if (m.direction==="OUTGOING" && inWin(londonDate(m._ts))){
+      activity.push({
+        person: personFromActor(m.senders && m.senders[0] && m.senders[0].actorId),
+        type: genuine ? "customer" : "admin",
+        cat: genuine ? threadCat : null,
+        subj: (threadSubj||"(no subject)").slice(0,80),
+        time: hhmm(m._ts)
+      });
+    }
+  }
 
-  return { enquiry:{
-    id: thread.id, cat,
-    who: atg?.buyerName || (from ? from.split("@")[0] : (thread.associatedContactId?("Contact "+thread.associatedContactId):"Unknown")),
-    subj: (atg ? (atg.platform+" lot "+(atg.lot||"?")) : (subject||"(no subject)")).slice(0,90),
-    time: hhmm(enquiry._ts),
-    handler, status,
-    summary: (atg?.message || text || subject || "").slice(0,400),
-    response: reply ? ("Replied "+hhmm(reply._ts)+(handler!=="—"?" by "+handler:"")) : "",
-    note: (atg && !atg.buyerName) ? "i-bidder/BidSpotter buyer — name not in enquiry." : "",
-    buyerEmail: atg?.buyerEmail || from || null, buyerName: atg?.buyerName||null,
-    buyerPhone: atg?.buyerPhone||null, lot: atg?.lot||null, threadStatus: thread.status||null
-  }};
+  // DEMAND — an inbound received in-window
+  let noise=null, enquiry=null;
+  const inb = msgs.find(m=>m.direction==="INCOMING" && inWin(londonDate(m._ts)));
+  if (inb){
+    const f=senderEmail(inb), s=inb.subject||"", t=inb.text||"";
+    if (spam) noise="Spam / other";
+    else {
+      const nb=noiseBucket(f,s,t);
+      if (nb) noise=nb;
+      else {
+        const atg=parseATG(s,t), c=classify(f,s,t,atg);
+        if (c==="partnership" && !looksHuman(f,t)) noise="Other / non-enquiry";
+        else {
+          const reply=msgs.find(m=>m.direction==="OUTGOING" && m._ts>inb._ts);
+          const handler=reply?personFromActor(reply.senders&&reply.senders[0]&&reply.senders[0].actorId):"—";
+          let status=(thread.status==="CLOSED")?"actioned":"open";
+          if (status==="open" && (nowMs-inb._ts)/86400000>OVERDUE_DAYS) status="overdue";
+          enquiry={ id:thread.id, cat:c,
+            who: atg?.buyerName || (f?f.split("@")[0]:(thread.associatedContactId?("Contact "+thread.associatedContactId):"Unknown")),
+            subj: (atg?(atg.platform+" lot "+(atg.lot||"?")):(s||"(no subject)")).slice(0,90),
+            time: hhmm(inb._ts), handler, status,
+            summary:(atg?.message||t||s||"").slice(0,400),
+            response:reply?("Replied "+hhmm(reply._ts)+(handler!=="—"?" by "+handler:"")):"",
+            note:(atg&&!atg.buyerName)?"i-bidder/BidSpotter buyer — name not in enquiry.":"",
+            buyerEmail:atg?.buyerEmail||f||null, buyerName:atg?.buyerName||null, buyerPhone:atg?.buyerPhone||null,
+            lot:atg?.lot||null, threadStatus:thread.status||null };
+        }
+      }
+    }
+  }
+  return { noise, enquiry, activity };
 }
 
 function json(obj, status){ return new Response(JSON.stringify(obj), { status:status||200,
@@ -200,16 +221,12 @@ export default async (req) => {
     const now = Date.now();
     let fromDay, toDay;
     if (url.searchParams.get("date")){ fromDay = toDay = url.searchParams.get("date"); }
-    else if (url.searchParams.get("from") && url.searchParams.get("to")){ fromDay = url.searchParams.get("from"); toDay = url.searchParams.get("to"); }
+    else if (url.searchParams.get("from") && url.searchParams.get("to")){ fromDay=url.searchParams.get("from"); toDay=url.searchParams.get("to"); }
     else { ({ fromDay, toDay } = reportWindow(now)); }
     const inbox = url.searchParams.get("inbox") || INBOX_ID;
     const sinceISO = new Date(Date.parse(fromDay+"T00:00:00Z") - 3*3600*1000).toISOString();
 
     let threads = await listThreads(inbox, sinceISO);
-    threads = threads.filter(t=>{
-      const rec = t.latestMessageReceivedTimestamp ? Date.parse(t.latestMessageReceivedTimestamp) : (t.latestMessageTimestamp?Date.parse(t.latestMessageTimestamp):0);
-      return rec && londonDate(rec)>=fromDay;
-    });
     const limit = Number(url.searchParams.get("limit")||0);
     if (limit>0) threads = threads.slice(0, limit);
 
@@ -218,27 +235,33 @@ export default async (req) => {
       catch(e){ return { error:String(e.message||e) }; }
     }, CONCURRENCY);
 
-    const enquiries=[]; const noise={};
+    const enquiries=[]; const noise={}; const activityItems=[]; const byPerson={};
     for (const p of processed){
       if (!p) continue;
-      if (p.noise){ noise[p.noise]=(noise[p.noise]||0)+1; continue; }
+      if (p.noise){ noise[p.noise]=(noise[p.noise]||0)+1; }
       if (p.enquiry) enquiries.push(p.enquiry);
+      for (const a of (p.activity||[])){
+        activityItems.push(a);
+        const b = byPerson[a.person] || (byPerson[a.person]={person:a.person,customer:0,admin:0,total:0,cats:{}});
+        b.total++; if (a.type==="customer"){ b.customer++; if (a.cat) b.cats[a.cat]=(b.cats[a.cat]||0)+1; } else b.admin++;
+      }
     }
-    const inbox_replies={};
-    for (const e of enquiries) if (e.handler && e.handler!=="—") inbox_replies[e.handler]=(inbox_replies[e.handler]||0)+1;
+    const activityPeople = Object.values(byPerson).filter(p=>p.person!=="—").sort((a,b)=>b.total-a.total);
+    const repliesInbox = {}; activityPeople.forEach(p=>{ if(p.customer) repliesInbox[p.person]=p.customer; });
 
     const quality=[];
     for (const q of enquiries.filter(x=>x.status==="overdue")) quality.push(["&#9873;","<b>"+q.who+"</b> — "+CAT_LABELS[q.cat]+" open "+OVERDUE_DAYS+"+ days. "+(q.summary||"").slice(0,120)]);
     const nameless = enquiries.filter(x=>x.lot && x.buyerName && x.buyerEmail);
-    if (nameless.length) quality.push(["&#9888;", nameless.length+" i-bidder/BidSpotter buyer(s) arrived with name + phone in the enquiry — check the CRM contact captured them (auto-fix is v2)."]);
-    for (const q of enquiries.filter(x=>x.status==="open").slice(0,6)) quality.push(["&#9888;","<b>"+q.who+"</b> ("+CAT_LABELS[q.cat]+", "+q.time+") — still open (not actioned). Check it gets dealt with."]);
+    if (nameless.length) quality.push(["&#9888;", nameless.length+" i-bidder/BidSpotter buyer(s) arrived with name + phone — check the CRM contact captured them (auto-fix is v2)."]);
+    for (const q of enquiries.filter(x=>x.status==="open").slice(0,6)) quality.push(["&#9888;","<b>"+q.who+"</b> ("+CAT_LABELS[q.cat]+", "+q.time+") — still open (not actioned)."]);
 
     const noiseTotal = Object.values(noise).reduce((a,b)=>a+b,0);
     const payload = {
       date: rangeLabel(fromDay, toDay),
       generated_at: new Date().toISOString(),
       logged: enquiries.length + noiseTotal,
-      replies:{ inbox: inbox_replies },
+      replies:{ inbox: repliesInbox },
+      activity:{ byPerson: activityPeople, items: activityItems },
       outreach:{},
       noise: Object.entries(noise).sort((a,b)=>b[1]-a[1]),
       quality,
@@ -248,10 +271,13 @@ export default async (req) => {
 
     if (url.searchParams.get("dry")==="1")
       return json({ dry:true, report_date:toDay, from:fromDay, to:toDay, inbox, threads_seen:threads.length,
-        counts:{ logged:payload.logged, genuine:enquiries.length, actioned:enquiries.filter(e=>e.status==="actioned").length, open:enquiries.filter(e=>e.status!=="actioned").length, noise:noiseTotal }, payload });
+        counts:{ logged:payload.logged, genuine:enquiries.length,
+          actioned:enquiries.filter(e=>e.status==="actioned").length, open:enquiries.filter(e=>e.status!=="actioned").length,
+          noise:noiseTotal, activity_total:activityItems.length,
+          by_person: activityPeople.map(p=>p.person+": "+p.customer+"c/"+p.admin+"a") }, payload });
 
     await sbUpsert({ report_date:toDay, payload });
-    return json({ ok:true, report_date:toDay, from:fromDay, to:toDay, genuine:enquiries.length, noise:noiseTotal, written:true });
+    return json({ ok:true, report_date:toDay, from:fromDay, to:toDay, genuine:enquiries.length, noise:noiseTotal, activity:activityItems.length, written:true });
   } catch(e){
     return json({ error:String((e&&e.message)||e) },500);
   }
